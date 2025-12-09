@@ -27,5 +27,5 @@ next-env.d.ts
 
 # Others -------------------------------------------------
 *.pem
-*.txt
 /data
+/chroma_db

@@ -6,7 +6,9 @@
 3. pip3 install -r requirements.txt
 
 **Build the index:**
-python rag_os_agent.py --index
+
+python src/rag_os_agent.py --index
 
 **Once built, run the agent:**
-python rag_os_agent.py
+
+python src/rag_os_agent.py

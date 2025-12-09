@@ -1,13 +1,15 @@
+# rag_os_agent.py
+
 import os
 import uuid
-from typing import List, Dict
+from typing import List, Dict, cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 import chromadb
-from chromadb.config import Settings
-
+from chromadb.api.types import Embedding, Metadata
 from pypdf import PdfReader
 
 # ----------------------------------------------------------------------
@@ -15,15 +17,15 @@ from pypdf import PdfReader
 # ----------------------------------------------------------------------
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Local Chroma DB
-chroma_client = chromadb.Client(
-    Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory="./chroma_db"
-    )
-)
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY not set in environment or .env")
+
+client = OpenAI(api_key=api_key)
+
+# Use a persistent Chroma client (data auto-saved under ./chroma_db)
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection("desktop_docs")
 
 
@@ -33,27 +35,29 @@ collection = chroma_client.get_or_create_collection("desktop_docs")
 
 def load_text_from_file(path: str) -> str:
     """Extract text from txt/md/pdf."""
-    if path.lower().endswith(".pdf"):
+    path_lower = path.lower()
+
+    if path_lower.endswith(".pdf"):
         try:
             reader = PdfReader(path)
             pages = [page.extract_text() or "" for page in reader.pages]
             return "\n".join(pages)
         except Exception as e:
-            print(f"Failed PDF read {path}: {e}")
+            print(f"Failed to read PDF {path}: {e}")
             return ""
-    else:
-        # txt, md, etc.
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
-        except:
-            print(f"Failed text read {path}")
-            return ""
+
+    # Fallback: assume text-like file
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        print(f"Failed to read text file {path}: {e}")
+        return ""
 
 
 def chunk_text(text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
     """Simple character-based chunking."""
-    chunks = []
+    chunks: List[str] = []
     start = 0
     n = len(text)
 
@@ -62,35 +66,42 @@ def chunk_text(text: str, max_chars: int = 1000, overlap: int = 200) -> List[str
         chunk = text[start:end]
         if chunk.strip():
             chunks.append(chunk)
+        # avoid infinite loop when text is shorter than max_chars
+        if end == n:
+            break
         start = end - overlap
 
     return chunks
 
 
 # ----------------------------------------------------------------------
-# Embedding helper
+# Embedding helper (OpenAI embeddings)
 # ----------------------------------------------------------------------
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Batch embedding request."""
+def embed_texts(texts: List[str]) -> List[Embedding]:
+    """Batch embedding request using OpenAI, returning Chroma-compatible Embeddings."""
     response = client.embeddings.create(
         model="text-embedding-3-small",
         input=texts,
     )
-    return [item.embedding for item in response.data]
+    embeddings: List[Embedding] = cast(
+        List[Embedding],
+        [d.embedding for d in response.data],
+    )
+    return embeddings
 
 
 # ----------------------------------------------------------------------
 # Indexing
 # ----------------------------------------------------------------------
 
-def index_directory(root_dir: str):
+def index_directory(root_dir: str) -> None:
     """
     Build the vector index: read files → chunk → embed → store in Chroma.
     """
-    docs = []
-    metadatas = []
-    ids = []
+    docs: List[str] = []
+    metadatas: List[Metadata] = []
+    ids: List[str] = []
 
     print(f"\nIndexing directory: {root_dir}")
 
@@ -103,33 +114,37 @@ def index_directory(root_dir: str):
             print(f"  Reading {full_path}")
 
             text = load_text_from_file(full_path)
-            if not text:
+            if not text.strip():
                 continue
 
             chunks = chunk_text(text)
             for idx, chunk in enumerate(chunks):
                 docs.append(chunk)
-                metadatas.append({
-                    "source_path": full_path,
-                    "chunk_index": idx,
-                })
+                metadatas.append(
+                    cast(
+                        Metadata,
+                        {
+                            "source_path": full_path,
+                            "chunk_index": idx,
+                        },
+                    )
+                )
                 ids.append(str(uuid.uuid4()))
 
     if not docs:
-        print("No documents found.")
+        print("No documents found to index.")
         return
 
-    print("Embedding chunks...")
+    print(f"Embedding {len(docs)} chunks...")
     embeddings = embed_texts(docs)
 
-    print("Adding to Chroma...")
+    print("Adding to Chroma collection...")
     collection.add(
         ids=ids,
         embeddings=embeddings,
         documents=docs,
         metadatas=metadatas,
     )
-    chroma_client.persist()
 
     print(f"Done. Indexed {len(docs)} chunks.\n")
 
@@ -140,63 +155,86 @@ def index_directory(root_dir: str):
 
 def retrieve_chunks(query: str, k: int = 5) -> List[Dict]:
     """Embed the question → search local DB → return top chunks."""
-    query_embedding = embed_texts([query])[0]
+    query_embedding_list = embed_texts([query])
+    if not query_embedding_list:
+        return []
+
+    query_embedding = query_embedding_list[0]
 
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=k,
-        include=["documents", "metadatas"]
+        include=["documents", "metadatas"],
     )
 
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
+    documents = results.get("documents")
+    metadatas = results.get("metadatas")
 
-    chunks = []
-    for doc, meta in zip(docs, metas):
-        chunks.append({
-            "text": doc,
-            "source_path": meta["source_path"],
-            "chunk_index": meta["chunk_index"],
-        })
+    # Guard against None or empty results
+    if (
+        not documents
+        or not metadatas
+        or len(documents) == 0
+        or len(metadatas) == 0
+        or documents[0] is None
+        or metadatas[0] is None
+    ):
+        return []
+
+    docs0 = documents[0]
+    metas0 = metadatas[0]
+
+    chunks: List[Dict] = []
+    for doc, meta in zip(docs0, metas0):
+        chunks.append(
+            {
+                "text": doc,
+                "source_path": meta.get("source_path"),
+                "chunk_index": meta.get("chunk_index"),
+            }
+        )
 
     return chunks
 
 
-def build_prompt(question: str, chunks: List[Dict]) -> List[Dict]:
+def build_prompt(question: str, chunks: List[Dict]) -> List[ChatCompletionMessageParam]:
     """Construct chat prompt using retrieved chunks."""
-    context = ""
+    context_parts: List[str] = []
 
     for i, ch in enumerate(chunks):
-        context += (
+        context_parts.append(
             f"[Chunk {i+1} | {ch['source_path']} | part {ch['chunk_index']}]\n"
-            f"{ch['text']}\n\n"
+            f"{ch['text']}\n"
         )
 
-    return [
+    context_text = "\n".join(context_parts)
+
+    messages: List[ChatCompletionMessageParam] = [
         {
             "role": "system",
             "content": (
                 "You are my personal OS assistant. "
                 "Use the provided document context to answer the question. "
-                "If context is insufficient, say so."
-            )
+                "If the context is insufficient, say that you are not sure."
+            ),
         },
         {
             "role": "system",
-            "content": f"CONTEXT:\n{context}"
+            "content": f"CONTEXT:\n{context_text}",
         },
         {
             "role": "user",
-            "content": question
-        }
+            "content": question,
+        },
     ]
+    return messages
 
 
 def answer_question(question: str) -> str:
     """Full RAG retrieval + OpenAI answer."""
     chunks = retrieve_chunks(question, k=5)
     if not chunks:
-        return "No relevant documents found."
+        return "No relevant documents found in the index."
 
     messages = build_prompt(question, chunks)
 
@@ -205,7 +243,8 @@ def answer_question(question: str) -> str:
         messages=messages,
     )
 
-    return response.choices[0].message.content
+    content = response.choices[0].message.content or ""
+    return content
 
 
 # ----------------------------------------------------------------------
@@ -219,7 +258,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--index",
         action="store_true",
-        help="Rebuild the document index from ./data"
+        help="Rebuild the document index from ./data",
     )
     args = parser.parse_args()
 
@@ -227,7 +266,7 @@ if __name__ == "__main__":
         index_directory("./data")
 
     print("📁 Personal RAG Desktop Agent ready.")
-    print("Ask a question (or type 'exit').")
+    print("Put files under ./data, then ask questions (or type 'exit').")
 
     while True:
         q = input("\nYou: ").strip()
