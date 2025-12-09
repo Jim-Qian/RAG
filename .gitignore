@@ -1,0 +1,31 @@
+# Backend --------------------------------------------------
+__pycache__/
+.DS_Store
+secrets.json
+# session
+flask_session/
+*.rdb
+
+# Frontend -------------------------------------------------
+
+# dependencies
+node_modules/
+env/
+
+# production
+/build
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+# env files
+.env*
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# Others -------------------------------------------------
+*.pem
+*.txt
+/data
