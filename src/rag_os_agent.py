@@ -1,5 +1,3 @@
-# rag_os_agent.py
-
 import os
 import uuid
 from typing import List, Dict, cast
